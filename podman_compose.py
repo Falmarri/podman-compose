@@ -21,7 +21,6 @@ from asyncio.subprocess import PIPE
 import asyncio
 import signal
 
-from multiprocessing import cpu_count
 
 import shlex
 from asyncio import Task
@@ -1188,10 +1187,10 @@ class Podman:
         stdout_data, stderr_data = await p.communicate()
         if p.returncode == 0:
             return stdout_data
-        else:
-            raise subprocess.CalledProcessError(
-                p.returncode, " ".join(cmd_ls), stderr_data
-            )
+
+        raise subprocess.CalledProcessError(
+            p.returncode, " ".join(cmd_ls), stderr_data
+        )
 
     def exec(
         self,
@@ -1205,7 +1204,7 @@ class Podman:
         log(" ".join([str(i) for i in cmd_ls]))
         os.execlp(self.podman_path, *cmd_ls)
 
-    async def run(self, podman_args, cmd="", cmd_args=None, log_formatter=None) -> int:
+    async def run(self, podman_args, cmd="", cmd_args=None, log_formatter=None, *, task_reference=set()) -> int:
         cmd_args = list(map(str, cmd_args or []))
         xargs = self.compose.get_podman_args(cmd) if cmd else []
         cmd_ls = [self.podman_path, *podman_args, cmd] + xargs + cmd_args
@@ -1215,19 +1214,27 @@ class Podman:
 
         if log_formatter is not None:
 
-            async def format_out(stdout):
+            async def format_out(out: asyncio.streams.StreamReader):
                 while True:
-                    l = await stdout.readline()
+                    l = await out.readline()
                     if l:
                         print(log_formatter, l.decode("utf-8"), end="")
-                    if stdout.at_eof():
+                    if out.at_eof():
                         break
 
             p = await asyncio.create_subprocess_exec(
                 *cmd_ls, stdout=PIPE, stderr=PIPE
-            )  # pylint: disable=consider-using-with
+            )
+
+            # This is hacky to make the tasks not get garbage collected
+            # https://github.com/python/cpython/issues/91887
             out_t = asyncio.create_task(format_out(p.stdout))
+            task_reference.add(out_t)
+            out_t.add_done_callback(task_reference.discard)
+
             err_t = asyncio.create_task(format_out(p.stderr))
+            task_reference.add(err_t)
+            err_t.add_done_callback(task_reference.discard)
 
         else:
             p = await asyncio.create_subprocess_exec(
@@ -1237,13 +1244,13 @@ class Podman:
         try:
             exit_code = await p.wait()
         except asyncio.CancelledError as e:
-            log(f"Sending termination signal")
+            log("Sending termination signal")
             p.terminate()
             try:
                 async with asyncio.timeout(10):
                     exit_code = await p.wait()
             except TimeoutError:
-                log(f"container did not shut down after 10 seconds, killing")
+                log("container did not shut down after 10 seconds, killing")
                 p.kill()
                 exit_code = await p.wait()
 
@@ -1292,8 +1299,8 @@ class Pool:
     async def join(self, *, desc="joining enqueued tasks") -> int:
         if not self.tasks:
             return 0
-        ls = await tqdm.gather(*self.tasks, desc=desc)
-        failed = [i for i in ls if i != 0]
+        ls = await asyncio.gather(*self.tasks)
+        failed = [i for i in ls if i is not None and i != 0]
         del self.tasks[:]
         count = len(failed)
         if count > 1:
@@ -1498,8 +1505,8 @@ COMPOSE_DEFAULT_LS = [
 
 class PodmanCompose:
     def __init__(self):
-        self.podman = None
-        self.pool = None
+        self.podman: Podman | None = None
+        self.pool: Pool | None = None
         self.podman_version = None
         self.environ = {}
         self.exit_code = None
@@ -2165,7 +2172,7 @@ async def compose_push(compose, args):
         await compose.podman.run([], "push", [cnt["image"]])
 
 
-async def build_one(compose, args, cnt):
+async def build_one(compose: PodmanCompose, args, cnt):
     if "build" not in cnt:
         return None
     if getattr(args, "if_not_exists", None):
@@ -2226,7 +2233,7 @@ async def build_one(compose, args, cnt):
             )
         )
     build_args.append(ctx)
-    status = await compose.podman.run([], "build", build_args)
+    status = await compose.podman.run([], "build", build_args, log_formatter=cnt["name"] + ": ")
     return status
 
 
@@ -2235,15 +2242,17 @@ async def compose_build(compose: PodmanCompose, args):
     if args.services:
         container_names_by_service = compose.container_names_by_service
         compose.assert_services(args.services)
-        for service in tqdm(args.services, desc="building"):
+        for service in args.services:
             cnt = compose.container_by_name[container_names_by_service[service][0]]
-            compose.pool.create_task(build_one(compose, args, cnt))
+            if "build" in cnt:
+                compose.pool.create_task(build_one(compose, args, cnt))
 
     else:
-        for cnt in tqdm(compose.containers, desc="building"):
-            compose.pool.create_task(build_one(compose, args, cnt))
+        for cnt in compose.containers:
+            if "build" in cnt:
+                compose.pool.create_task(build_one(compose, args, cnt))
 
-    return await compose.pool.join(desc="waiting build")
+    return await compose.pool.join(desc="building")
 
 
 async def create_pods(compose, args):  # pylint: disable=unused-argument
@@ -2271,7 +2280,8 @@ def get_excluded(compose, args):
         for service in args.services:
             excluded -= compose.services[service]["_deps"]
             excluded.discard(service)
-    log("** excluding: ", excluded)
+    if excluded:
+        log("** excluding: ", excluded)
     return excluded
 
 
@@ -2408,7 +2418,7 @@ async def compose_down(compose: PodmanCompose, args):
     timeout_global = getattr(args, "timeout", None)
     containers = list(reversed(compose.containers))
 
-    for cnt in tqdm(containers, "stopping ..."):
+    for cnt in containers:
         if cnt["_service"] in excluded:
             continue
         podman_stop_args = [*podman_args]
