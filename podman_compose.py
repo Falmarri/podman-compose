@@ -17,7 +17,8 @@ import hashlib
 import random
 import json
 import glob
-import asyncio.subprocess
+from asyncio.subprocess import PIPE
+import asyncio
 import signal
 
 from multiprocessing import cpu_count
@@ -1182,8 +1183,8 @@ class Podman:
         xargs = self.compose.get_podman_args(cmd) if cmd else []
         cmd_ls = [self.podman_path, *podman_args, cmd] + xargs + cmd_args
         log(cmd_ls)
-        p = await asyncio.subprocess.create_subprocess_exec(
-            *cmd_ls, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        p = await asyncio.create_subprocess_exec(
+            *cmd_ls, stdout=PIPE, stderr=PIPE
         )
 
         stdout_data, stderr_data = await p.communicate()
@@ -1224,14 +1225,14 @@ class Podman:
                     if stdout.at_eof():
                         break
 
-            p = await asyncio.subprocess.create_subprocess_exec(
-                *cmd_ls, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            p = await asyncio.create_subprocess_exec(
+                *cmd_ls, stdout=PIPE, stderr=PIPE
             )  # pylint: disable=consider-using-with
             out_t = asyncio.create_task(format_out(p.stdout))
             err_t = asyncio.create_task(format_out(p.stderr))
 
         else:
-            p = await asyncio.subprocess.create_subprocess_exec(
+            p = await asyncio.create_subprocess_exec(
                 *cmd_ls
             )  # pylint: disable=consider-using-with
 
@@ -1967,7 +1968,7 @@ class PodmanCompose:
         parser.add_argument(
             "--parallel",
             type=int,
-            default=os.environ.get("COMPOSE_PARALLEL_LIMIT", 2 * cpu_count()),
+            default=os.environ.get("COMPOSE_PARALLEL_LIMIT", sys.maxsize),
         )
 
 
@@ -2244,7 +2245,7 @@ async def compose_build(compose: PodmanCompose, args):
         for cnt in tqdm(compose.containers, desc="building"):
             compose.pool.create_task(build_one(compose, args, cnt))
 
-    return await compose.pool.join("waiting build")
+    return await compose.pool.join(desc="waiting build")
 
 
 async def create_pods(compose, args):  # pylint: disable=unused-argument
