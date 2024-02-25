@@ -1183,9 +1183,7 @@ class Podman:
         xargs = self.compose.get_podman_args(cmd) if cmd else []
         cmd_ls = [self.podman_path, *podman_args, cmd] + xargs + cmd_args
         log(cmd_ls)
-        p = await asyncio.create_subprocess_exec(
-            *cmd_ls, stdout=PIPE, stderr=PIPE
-        )
+        p = await asyncio.create_subprocess_exec(*cmd_ls, stdout=PIPE, stderr=PIPE)
 
         stdout_data, stderr_data = await p.communicate()
         if p.returncode == 0:
